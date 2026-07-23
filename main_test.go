@@ -169,7 +169,7 @@ func TestRun_UnsupportedDiarizeWarnsAndContinues(t *testing.T) {
 	}
 	bin := whisperFixtureBinary(t, dir)
 
-	code, stdout, stderr := runCLI(t, []string{"--diarize", audio}, "",
+	code, stdout, stderr := runCLI(t, []string{"-p", "whisper", "--diarize", audio}, "",
 		envMap(map[string]string{"GOLISTEN_WHISPER_BIN": bin, "GOLISTEN_WHISPER_MODEL": modelFixture(t, dir)}))
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0. stderr: %s", code, stderr)
@@ -219,7 +219,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 	})
 
 	t.Run("txt to stdout", func(t *testing.T) {
-		code, stdout, stderr := runCLI(t, []string{audio}, "", env)
+		code, stdout, stderr := runCLI(t, []string{"-p", "whisper", audio}, "", env)
 		if code != 0 {
 			t.Fatalf("exit code = %d: %s", code, stderr)
 		}
@@ -230,7 +230,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 	})
 
 	t.Run("srt", func(t *testing.T) {
-		code, stdout, _ := runCLI(t, []string{"-f", "srt", audio}, "", env)
+		code, stdout, _ := runCLI(t, []string{"-p", "whisper", "-f", "srt", audio}, "", env)
 		if code != 0 {
 			t.Fatalf("exit code = %d", code)
 		}
@@ -240,7 +240,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 	})
 
 	t.Run("audio piped on stdin", func(t *testing.T) {
-		code, stdout, stderr := runCLI(t, []string{}, string(testWAV()), env)
+		code, stdout, stderr := runCLI(t, []string{"-p", "whisper"}, string(testWAV()), env)
 		if code != 0 {
 			t.Fatalf("exit code = %d: %s", code, stderr)
 		}
@@ -250,7 +250,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 	})
 
 	t.Run("explicit - reads stdin", func(t *testing.T) {
-		code, stdout, _ := runCLI(t, []string{"-"}, string(testWAV()), env)
+		code, stdout, _ := runCLI(t, []string{"-p", "whisper", "-"}, string(testWAV()), env)
 		if code != 0 {
 			t.Fatalf("exit code = %d", code)
 		}
@@ -261,7 +261,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 
 	t.Run("output file", func(t *testing.T) {
 		out := filepath.Join(dir, "out.txt")
-		code, stdout, stderr := runCLI(t, []string{"-o", out, audio}, "", env)
+		code, stdout, stderr := runCLI(t, []string{"-p", "whisper", "-o", out, audio}, "", env)
 		if code != 0 {
 			t.Fatalf("exit code = %d", code)
 		}
@@ -282,7 +282,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 
 	t.Run("--show also prints when saving", func(t *testing.T) {
 		out := filepath.Join(dir, "out2.txt")
-		code, stdout, _ := runCLI(t, []string{"-o", out, "-s", audio}, "", env)
+		code, stdout, _ := runCLI(t, []string{"-p", "whisper", "-o", out, "-s", audio}, "", env)
 		if code != 0 {
 			t.Fatalf("exit code = %d", code)
 		}
@@ -292,7 +292,7 @@ func TestRun_LocalWhisperEndToEnd(t *testing.T) {
 	})
 
 	t.Run("unwritable output path is an error", func(t *testing.T) {
-		code, _, stderr := runCLI(t, []string{"-o", "/no/such/dir/out.txt", audio}, "", env)
+		code, _, stderr := runCLI(t, []string{"-p", "whisper", "-o", "/no/such/dir/out.txt", audio}, "", env)
 		if code != 1 {
 			t.Fatalf("exit code = %d, want 1", code)
 		}
@@ -310,7 +310,7 @@ func TestRun_LocalEngineFailureIsReported(t *testing.T) {
 	}
 	bin := writeScript(t, dir, "whisper-cli", "echo 'error: bad model file' >&2\nexit 1\n")
 
-	code, _, stderr := runCLI(t, []string{audio}, "",
+	code, _, stderr := runCLI(t, []string{"-p", "whisper", audio}, "",
 		envMap(map[string]string{"GOLISTEN_WHISPER_BIN": bin, "GOLISTEN_WHISPER_MODEL": modelFixture(t, dir)}))
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
@@ -348,7 +348,7 @@ cp "$IN" `+copyPath+`
 echo '{"result":{"language":"en"},"transcription":[]}' > "$OUT.json"
 `)
 
-	code, _, stderr := runCLI(t, []string{audio}, "",
+	code, _, stderr := runCLI(t, []string{"-p", "whisper", audio}, "",
 		envMap(map[string]string{"GOLISTEN_WHISPER_BIN": bin, "GOLISTEN_WHISPER_MODEL": modelFixture(t, dir)}))
 	if code != 0 {
 		t.Fatalf("exit code = %d: %s", code, stderr)
@@ -766,4 +766,199 @@ func TestMainEntryPoint(t *testing.T) {
 			t.Fatalf("usage was not printed: %q", out.String())
 		}
 	})
+}
+
+func TestResolveDownload(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantFile string
+		wantHost string
+	}{
+		// transcribe.cpp GGUF weights
+		{"parakeet", "parakeet-tdt-0.6b-v3-Q4_K_M.gguf", "handy-computer"},
+		{"Parakeet", "parakeet-tdt-0.6b-v3-Q4_K_M.gguf", "handy-computer"},
+		{"parakeet-q8", "parakeet-tdt-0.6b-v3-Q8_0.gguf", "handy-computer"},
+		{"parakeet-v2", "parakeet-tdt-0.6b-v2-Q4_K_M.gguf", "handy-computer"},
+		{"parakeet-tdt-0.6b-v3-F16.gguf", "parakeet-tdt-0.6b-v3-F16.gguf", "handy-computer"},
+		// whisper.cpp ggml weights, however the name is spelled
+		{"base.en", "ggml-base.en.bin", "ggerganov"},
+		{"ggml-base.en", "ggml-base.en.bin", "ggerganov"},
+		{"ggml-base.en.bin", "ggml-base.en.bin", "ggerganov"},
+		{"large-v3-turbo", "ggml-large-v3-turbo.bin", "ggerganov"},
+	}
+	for _, tc := range cases {
+		file, url := resolveDownload(tc.input)
+		if file != tc.wantFile {
+			t.Errorf("resolveDownload(%q) file = %q, want %q", tc.input, file, tc.wantFile)
+		}
+		if !strings.Contains(url, tc.wantHost) {
+			t.Errorf("resolveDownload(%q) url = %q, want it to point at %s", tc.input, url, tc.wantHost)
+		}
+		if !strings.HasSuffix(url, file) {
+			t.Errorf("resolveDownload(%q) url %q does not end in the filename", tc.input, url)
+		}
+	}
+}
+
+func TestRankTranscribeModel(t *testing.T) {
+	better := func(a, b string) {
+		t.Helper()
+		if rankTranscribeModel(a) >= rankTranscribeModel(b) {
+			t.Errorf("%q should rank ahead of %q", a, b)
+		}
+	}
+	// Parakeet is the default family for general speech.
+	better("parakeet-tdt-0.6b-v3-Q4_K_M.gguf", "canary-1b-flash-Q4_K_M.gguf")
+	better("canary-1b-flash-Q4_K_M.gguf", "whisper-large-v3-Q4_K_M.gguf")
+	// Quantisation only breaks ties inside a family.
+	better("parakeet-tdt-0.6b-v3-Q8_0.gguf", "parakeet-tdt-0.6b-v3-Q4_K_M.gguf")
+	better("parakeet-tdt-0.6b-v3-Q4_K_M.gguf", "parakeet-tdt-0.6b-v3-F32.gguf")
+	// A better family beats a better quantisation.
+	better("parakeet-tdt-0.6b-v3-F32.gguf", "whisper-large-v3-Q8_0.gguf")
+}
+
+// fakeEngine builds an engineLocations whose binary and model both resolve, or
+// deliberately do not, without touching the real filesystem.
+func fakeEngine(t *testing.T, dir, name string, installed bool) engineLocations {
+	t.Helper()
+	loc := engineLocations{
+		binEnv:     "FAKE_BIN_" + strings.ToUpper(name),
+		modelEnv:   "FAKE_MODEL_" + strings.ToUpper(name),
+		binNames:   []string{"definitely-not-installed-" + name},
+		modelDirs:  []string{filepath.Join(dir, name)},
+		modelMatch: func(string) bool { return true },
+		install:    "install " + name,
+	}
+	if !installed {
+		return loc
+	}
+	sub := filepath.Join(dir, name)
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "model.bin"), []byte("m"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loc.binPaths = []string{writeScript(t, sub, "engine", "exit 0\n")}
+	return loc
+}
+
+func TestResolveAutoProvider(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("prefers transcribe.cpp when it is installed", func(t *testing.T) {
+		locs := map[string]engineLocations{
+			"transcribe": fakeEngine(t, dir, "transcribe", true),
+			"whisper":    fakeEngine(t, dir, "whisper", true),
+			"parakeet":   fakeEngine(t, dir, "parakeet", true),
+		}
+		got, err := resolveAutoProvider(autoProviderOrder(false), locs, "", "", emptyEnv)
+		if err != nil {
+			t.Fatalf("resolveAutoProvider: %v", err)
+		}
+		if got != "transcribe" {
+			t.Fatalf("provider = %q, want transcribe", got)
+		}
+	})
+
+	t.Run("falls back to whisper when transcribe.cpp is absent", func(t *testing.T) {
+		locs := map[string]engineLocations{
+			"transcribe": fakeEngine(t, dir, "missing-transcribe", false),
+			"whisper":    fakeEngine(t, dir, "whisper", true),
+			"parakeet":   fakeEngine(t, dir, "missing-parakeet", false),
+		}
+		got, err := resolveAutoProvider(autoProviderOrder(false), locs, "", "", emptyEnv)
+		if err != nil {
+			t.Fatalf("resolveAutoProvider: %v", err)
+		}
+		if got != "whisper" {
+			t.Fatalf("provider = %q, want whisper", got)
+		}
+	})
+
+	// A model with a binary but no weights is not usable, and picking it would
+	// only produce an error further down.
+	t.Run("skips an engine with a binary but no model", func(t *testing.T) {
+		half := fakeEngine(t, dir, "halfinstalled", true)
+		half.modelDirs = []string{filepath.Join(dir, "nowhere")}
+		locs := map[string]engineLocations{
+			"transcribe": half,
+			"whisper":    fakeEngine(t, dir, "whisper", true),
+		}
+		got, err := resolveAutoProvider(autoProviderOrder(false), locs, "", "", emptyEnv)
+		if err != nil {
+			t.Fatalf("resolveAutoProvider: %v", err)
+		}
+		if got != "whisper" {
+			t.Fatalf("provider = %q, want whisper", got)
+		}
+	})
+
+	// Parakeet has no translate task, so --translate has to start at whisper
+	// rather than pick an engine that will refuse the request.
+	t.Run("translation prefers whisper", func(t *testing.T) {
+		locs := map[string]engineLocations{
+			"transcribe": fakeEngine(t, dir, "transcribe", true),
+			"whisper":    fakeEngine(t, dir, "whisper", true),
+		}
+		got, err := resolveAutoProvider(autoProviderOrder(true), locs, "", "", emptyEnv)
+		if err != nil {
+			t.Fatalf("resolveAutoProvider: %v", err)
+		}
+		if got != "whisper" {
+			t.Fatalf("provider = %q, want whisper when translating", got)
+		}
+	})
+
+	t.Run("reports how to install when nothing is found", func(t *testing.T) {
+		locs := map[string]engineLocations{
+			"transcribe": fakeEngine(t, dir, "none-t", false),
+			"whisper":    fakeEngine(t, dir, "none-w", false),
+			"parakeet":   fakeEngine(t, dir, "none-p", false),
+		}
+		_, err := resolveAutoProvider(autoProviderOrder(false), locs, "", "", emptyEnv)
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		for _, want := range []string{"--download parakeet", "whisper-cpp", "-p openai"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error should mention %q, got: %v", want, err)
+			}
+		}
+	})
+}
+
+func TestAutoProviderOrder(t *testing.T) {
+	if got := autoProviderOrder(false)[0]; got != "transcribe" {
+		t.Errorf("default order starts with %q, want transcribe", got)
+	}
+	if got := autoProviderOrder(true)[0]; got != "whisper" {
+		t.Errorf("translate order starts with %q, want whisper", got)
+	}
+}
+
+func TestCheckProviderSupportsFormat(t *testing.T) {
+	if err := checkProviderSupportsFormat("parakeet", true); err == nil {
+		t.Error("parakeet cannot produce timed output and should be rejected")
+	}
+	if err := checkProviderSupportsFormat("parakeet", false); err != nil {
+		t.Errorf("plain text is fine for parakeet, got: %v", err)
+	}
+	for _, p := range []string{"whisper", "transcribe", "openai", "auto"} {
+		if err := checkProviderSupportsFormat(p, true); err != nil {
+			t.Errorf("%s should accept timed output, got: %v", p, err)
+		}
+	}
+}
+
+// Argument and input errors are more immediate than "no engine installed", so
+// they must not be masked by engine discovery.
+func TestRun_InputErrorsPrecedeEngineDiscovery(t *testing.T) {
+	code, _, stderr := runCLI(t, []string{"/no/such/file.mp3"}, "", emptyEnv)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "failed to read") {
+		t.Fatalf("expected the file error first, got %q", stderr)
+	}
 }

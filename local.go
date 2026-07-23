@@ -352,7 +352,10 @@ type engineLocations struct {
 	binPaths   []string // explicit candidates, ~ expanded
 	modelDirs  []string
 	modelMatch func(name string) bool
-	install    string // shown when nothing is found
+	// modelRank orders candidates within a directory, best first. Nil falls
+	// back to alphabetical order.
+	modelRank func(name string) int
+	install   string // shown when nothing is found
 }
 
 var whisperLocations = engineLocations{
@@ -360,6 +363,7 @@ var whisperLocations = engineLocations{
 	modelEnv: "GOLISTEN_WHISPER_MODEL",
 	binNames: []string{"whisper-cli", "whisper-cpp"},
 	binPaths: []string{
+		"~/.cache/golisten/bin/whisper-cli",
 		"/opt/homebrew/bin/whisper-cli",
 		"/usr/local/bin/whisper-cli",
 		"~/whisper.cpp/build/bin/whisper-cli",
@@ -385,6 +389,7 @@ var whisperLocations = engineLocations{
 		"./models",
 	},
 	modelMatch: isWhisperModel,
+	modelRank:  rankWhisperModel,
 	install:    "brew install whisper-cpp, then: golisten --download base.en",
 }
 
@@ -393,6 +398,7 @@ var parakeetLocations = engineLocations{
 	modelEnv: "GOLISTEN_PARAKEET_MODEL",
 	binNames: []string{"parakeet-cli"},
 	binPaths: []string{
+		"~/.cache/golisten/bin/parakeet-cli",
 		"/opt/homebrew/bin/parakeet-cli",
 		"/usr/local/bin/parakeet-cli",
 		"~/whisper.cpp/build/bin/parakeet-cli",
@@ -416,6 +422,7 @@ var transcribeLocations = engineLocations{
 	modelEnv: "GOLISTEN_TRANSCRIBE_MODEL",
 	binNames: []string{"transcribe-cli"},
 	binPaths: []string{
+		"~/.cache/golisten/bin/transcribe-cli",
 		"/opt/homebrew/bin/transcribe-cli",
 		"/usr/local/bin/transcribe-cli",
 		"~/transcribe.cpp/build/bin/transcribe-cli",
@@ -431,7 +438,8 @@ var transcribeLocations = engineLocations{
 		"./models",
 	},
 	modelMatch: isGGUFModel,
-	install:    "build transcribe.cpp and download a GGUF model from huggingface.co/handy-computer",
+	modelRank:  rankTranscribeModel,
+	install:    "build transcribe.cpp, then: golisten --download parakeet",
 }
 
 // isWhisperModel matches whisper.cpp's own ggml naming, excluding the dummy
@@ -575,8 +583,12 @@ func scanModelDirs(loc engineLocations, match func(string) bool) string {
 		if len(names) == 0 {
 			continue
 		}
+		rank := loc.modelRank
+		if rank == nil {
+			rank = func(string) int { return 0 }
+		}
 		sort.Slice(names, func(i, j int) bool {
-			ri, rj := rankWhisperModel(names[i]), rankWhisperModel(names[j])
+			ri, rj := rank(names[i]), rank(names[j])
 			if ri != rj {
 				return ri < rj
 			}
@@ -585,4 +597,88 @@ func scanModelDirs(loc engineLocations, match func(string) bool) string {
 		return filepath.Join(expanded, names[0])
 	}
 	return ""
+}
+
+// transcribeModelRank orders the model families transcribe.cpp can run,
+// best-first for general speech. Parakeet leads because it is both faster and
+// more accurate than the whisper models most people have lying around.
+var transcribeModelRank = []string{
+	"parakeet-tdt", "parakeet-unified", "parakeet-rnnt", "parakeet-ctc", "parakeet",
+	"canary-qwen", "canary",
+	"nemotron", "gigaam", "qwen3-asr", "voxtral", "granite", "moonshine", "sensevoice",
+	"whisper",
+}
+
+// transcribeQuantRank breaks ties within a family. Q8_0 keeps essentially all
+// of the accuracy at a third of the size, so it is preferred over the larger
+// float weights and the lossier low-bit quantisations.
+var transcribeQuantRank = []string{"q8_0", "q6_k", "q5_k_m", "q4_k_m", "f16", "f32"}
+
+// rankTranscribeModel scores a GGUF filename by family first, then by
+// quantisation, so a directory holding several models yields the best general
+// choice rather than whichever sorts first alphabetically.
+func rankTranscribeModel(name string) int {
+	lower := strings.ToLower(name)
+
+	family := len(transcribeModelRank)
+	for i, tag := range transcribeModelRank {
+		if strings.Contains(lower, tag) {
+			family = i
+			break
+		}
+	}
+	quant := len(transcribeQuantRank)
+	for i, tag := range transcribeQuantRank {
+		if strings.Contains(lower, tag) {
+			quant = i
+			break
+		}
+	}
+	// Family dominates; quantisation only separates models of the same family.
+	return family*(len(transcribeQuantRank)+1) + quant
+}
+
+// engineLocationsByName maps a local backend to where its binary and models
+// live.
+var engineLocationsByName = map[string]engineLocations{
+	"whisper":    whisperLocations,
+	"parakeet":   parakeetLocations,
+	"transcribe": transcribeLocations,
+}
+
+// autoProviderOrder is the order backends are tried when no -p is given.
+// transcribe.cpp comes first so parakeet is the default when it is installed.
+// Translation reorders it: parakeet has no translate task, so asking for
+// English output has to start with whisper rather than fail.
+func autoProviderOrder(translate bool) []string {
+	if translate {
+		return []string{"whisper", "transcribe", "parakeet"}
+	}
+	return []string{"transcribe", "whisper", "parakeet"}
+}
+
+// resolveAutoProvider picks the first local backend that has both a binary and
+// a model available. An explicit -m therefore also selects the engine: a .gguf
+// name resolves to transcribe.cpp, a ggml-*.bin name to whisper.cpp.
+func resolveAutoProvider(order []string, locations map[string]engineLocations,
+	binary, model string, getenv func(string) string) (string, error) {
+
+	for _, name := range order {
+		loc, ok := locations[name]
+		if !ok {
+			continue
+		}
+		if _, err := findBinary(loc, binary, getenv); err != nil {
+			continue
+		}
+		if _, err := findModel(loc, model, getenv); err != nil {
+			continue
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("no local speech-to-text engine found.\n"+
+		"Install one:\n"+
+		"  transcribe.cpp (parakeet, the default):  build it, then golisten --download parakeet\n"+
+		"  whisper.cpp:                             brew install whisper-cpp, then golisten --download base.en\n"+
+		"Or use a hosted backend, e.g. golisten -p openai %s", "audio.mp3")
 }

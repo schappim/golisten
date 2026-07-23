@@ -16,7 +16,9 @@ const (
 	defaultElevenLabsModel = "scribe_v1"
 	defaultDeepgramModel   = "nova-3"
 
-	defaultProvider = "whisper"
+	// The default backend is resolved at run time from what is installed —
+	// see autoProviderOrder — rather than being pinned to one engine.
+	defaultProvider = "auto"
 	defaultFormat   = "txt"
 	defaultLanguage = "auto"
 
@@ -33,8 +35,9 @@ const (
 // rather than a const so tests can swap it in for fast-running retry tests.
 var initialBackoff = 1 * time.Second
 
-// providers lists every backend, local first.
-var providers = []string{"whisper", "parakeet", "transcribe", "openai", "elevenlabs", "deepgram"}
+// providers lists every backend, local first. "auto" is not a backend of its
+// own: it resolves to whichever local engine is installed.
+var providers = []string{"auto", "whisper", "parakeet", "transcribe", "openai", "elevenlabs", "deepgram"}
 
 // localProviders are the backends that shell out to a locally-installed engine
 // rather than a hosted API.
@@ -113,7 +116,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			opts.provider, strings.Join(providers, ", "))
 		return 1
 	}
-
 	opts.format = strings.ToLower(opts.format)
 	if !containsString([]string{"txt", "srt", "vtt", "json"}, opts.format) {
 		fmt.Fprintf(stderr, "Error: Invalid format '%s'. Use txt, srt, vtt, or json\n", opts.format)
@@ -121,20 +123,42 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 
 	needSegments := formatNeedsSegments(opts.format, opts.timestamps)
-	if needSegments && opts.provider == "parakeet" {
-		fmt.Fprintln(stderr, "Error: the parakeet backend returns text without timestamps.")
-		fmt.Fprintln(stderr, "       Use -p transcribe for timestamped parakeet output, or -p whisper.")
+
+	// Combinations that can be ruled out from the flags alone are reported
+	// before anything touches the disk, so an impossible request fails fast.
+	if err := checkProviderSupportsFormat(opts.provider, needSegments); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
-	}
-	if opts.diarize && !containsString([]string{"elevenlabs", "deepgram", "transcribe"}, opts.provider) {
-		fmt.Fprintf(stderr, "Warning: --diarize is not supported by the %s backend, ignoring\n", opts.provider)
-		opts.diarize = false
 	}
 
 	audioBytes, source, err := readInput(opts.args, stdin)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
+	}
+
+	// Engine discovery probes the filesystem, so it runs only once the request
+	// itself is known to be well-formed.
+	if opts.provider == "auto" {
+		resolved, err := resolveAutoProvider(autoProviderOrder(opts.translate),
+			engineLocationsByName, opts.binary, opts.model, getenv)
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return 1
+		}
+		opts.provider = resolved
+		if opts.verbose {
+			fmt.Fprintf(stderr, "Backend: %s (auto-selected)\n", resolved)
+		}
+		if err := checkProviderSupportsFormat(opts.provider, needSegments); err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return 1
+		}
+	}
+
+	if opts.diarize && !containsString([]string{"elevenlabs", "deepgram", "transcribe"}, opts.provider) {
+		fmt.Fprintf(stderr, "Warning: --diarize is not supported by the %s backend, ignoring\n", opts.provider)
+		opts.diarize = false
 	}
 
 	transcript, err := transcribe(opts, audioBytes, needSegments, stderr, getenv)
@@ -175,11 +199,7 @@ func transcribe(opts options, audioBytes []byte, needSegments bool, stderr io.Wr
 // installed engine. Every supported engine reads that format, including
 // whisper.cpp builds old enough to predate its built-in MP3 decoding.
 func transcribeLocally(opts options, audioBytes []byte, stderr io.Writer, getenv func(string) string) (Transcript, error) {
-	locations := map[string]engineLocations{
-		"whisper":    whisperLocations,
-		"parakeet":   parakeetLocations,
-		"transcribe": transcribeLocations,
-	}[opts.provider]
+	locations := engineLocationsByName[opts.provider]
 
 	binary, err := findBinary(locations, opts.binary, getenv)
 	if err != nil {
@@ -385,11 +405,52 @@ func readInput(args []string, stdin io.Reader) ([]byte, string, error) {
 // as a var so tests can point it at a local server.
 var modelDownloadBase = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
-// downloadModel fetches a ggml whisper model into the golisten model cache,
-// which is first on the auto-discovery path.
+// parakeetDownloadBase hosts the GGUF builds transcribe.cpp runs. Also a var so
+// tests can redirect it.
+var parakeetDownloadBase = "https://huggingface.co/handy-computer"
+
+// parakeetDownloads are the shorthand names accepted by --download for
+// transcribe.cpp models, mapped to their Hugging Face repo and file. Q4_K_M is
+// the default: a third of the size of the float weights with no accuracy
+// difference that shows up in ordinary speech.
+var parakeetDownloads = map[string]struct{ repo, file string }{
+	"parakeet":      {"parakeet-tdt-0.6b-v3-gguf", "parakeet-tdt-0.6b-v3-Q4_K_M.gguf"},
+	"parakeet-q8":   {"parakeet-tdt-0.6b-v3-gguf", "parakeet-tdt-0.6b-v3-Q8_0.gguf"},
+	"parakeet-f16":  {"parakeet-tdt-0.6b-v3-gguf", "parakeet-tdt-0.6b-v3-F16.gguf"},
+	"parakeet-v2":   {"parakeet-tdt-0.6b-v2-gguf", "parakeet-tdt-0.6b-v2-Q4_K_M.gguf"},
+	"parakeet-en":   {"parakeet-unified-en-0.6b-gguf", "parakeet-unified-en-0.6b-Q4_K_M.gguf"},
+	"parakeet-ctc":  {"parakeet-ctc-0.6b-gguf", "parakeet-ctc-0.6b-Q4_K_M.gguf"},
+	"parakeet-rnnt": {"parakeet-rnnt-0.6b-gguf", "parakeet-rnnt-0.6b-Q4_K_M.gguf"},
+}
+
+// resolveDownload turns a --download argument into a filename and URL. Parakeet
+// shorthands resolve to GGUF weights for transcribe.cpp; everything else is
+// treated as a whisper.cpp ggml model name.
+func resolveDownload(name string) (filename, url string) {
+	if entry, ok := parakeetDownloads[strings.ToLower(name)]; ok {
+		return entry.file, parakeetDownloadBase + "/" + entry.repo + "/resolve/main/" + entry.file
+	}
+	// A full GGUF filename is passed through against the parakeet repo it names.
+	if strings.HasSuffix(strings.ToLower(name), ".gguf") {
+		for _, entry := range parakeetDownloads {
+			if entry.file == name {
+				return entry.file, parakeetDownloadBase + "/" + entry.repo + "/resolve/main/" + entry.file
+			}
+		}
+	}
+	clean := strings.TrimPrefix(strings.TrimSuffix(name, ".bin"), "ggml-")
+	filename = "ggml-" + clean + ".bin"
+	return filename, modelDownloadBase + "/" + filename
+}
+
+// downloadModel fetches a model into the golisten model cache, which is first
+// on the auto-discovery path.
 func downloadModel(name string, stderr io.Writer) error {
-	name = strings.TrimPrefix(strings.TrimSuffix(name, ".bin"), "ggml-")
-	if name == "" {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("no model name given")
+	}
+	filename, url := resolveDownload(name)
+	if filename == "ggml-.bin" {
 		return fmt.Errorf("no model name given")
 	}
 
@@ -402,14 +463,12 @@ func downloadModel(name string, stderr io.Writer) error {
 		return fmt.Errorf("cannot create %s: %w", dir, err)
 	}
 
-	filename := "ggml-" + name + ".bin"
 	dest := filepath.Join(dir, filename)
 	if _, err := os.Stat(dest); err == nil {
 		fmt.Fprintf(stderr, "Already downloaded: %s\n", dest)
 		return nil
 	}
 
-	url := modelDownloadBase + "/" + filename
 	fmt.Fprintf(stderr, "Downloading %s...\n", url)
 
 	resp, err := http.Get(url)
@@ -418,8 +477,10 @@ func downloadModel(name string, stderr io.Writer) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed (%d): no model named %q "+
-			"(try tiny.en, base.en, small.en, medium.en, large-v3-turbo)", resp.StatusCode, name)
+		return fmt.Errorf("download failed (%d): no model named %q\n"+
+			"  transcribe.cpp: parakeet, parakeet-q8, parakeet-f16, parakeet-v2, parakeet-en\n"+
+			"  whisper.cpp:    tiny.en, base.en, small.en, medium.en, large-v3-turbo",
+			resp.StatusCode, name)
 	}
 
 	// Download to a temporary name so an interrupted transfer can never be
@@ -471,4 +532,15 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// checkProviderSupportsFormat rejects a backend/format pairing that could only
+// produce an empty file. whisper.cpp's parakeet-cli is the one backend with no
+// timing output at all.
+func checkProviderSupportsFormat(provider string, needSegments bool) error {
+	if needSegments && provider == "parakeet" {
+		return fmt.Errorf("the parakeet backend returns text without timestamps.\n" +
+			"       Use -p transcribe for timestamped parakeet output, or -p whisper.")
+	}
+	return nil
 }
