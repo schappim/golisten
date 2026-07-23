@@ -46,6 +46,21 @@ cat note.mp3 | golisten -p openai | gospeak -v nova
 
 ## Installation
 
+### Homebrew (Recommended)
+
+```bash
+brew tap schappim/golisten
+brew trust schappim/golisten   # Homebrew 6 requires trusting third-party taps
+brew install golisten
+```
+
+See the [homebrew-golisten](https://github.com/schappim/homebrew-golisten) tap
+for more details.
+
+### Download Binary
+
+Download the latest release from the [releases page](https://github.com/schappim/golisten/releases).
+
 ### Build from Source
 
 ```bash
