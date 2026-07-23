@@ -1,0 +1,21 @@
+# Binary
+golisten
+golisten.exe
+dist/
+
+# Test artefacts
+*.mp3
+*.wav
+*.srt
+*.vtt
+models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
